@@ -1,0 +1,10 @@
+numpy
+faiss-cpu
+sentence-transformers
+langchain
+langchain-community
+langchain-text-splitters
+langgraph
+pypdf
+python-dotenv
+streamlit==1.29.0
