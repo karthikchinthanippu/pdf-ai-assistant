@@ -8,13 +8,13 @@ from langgraph.graph.message import add_messages
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain_community.llms import Ollama
+from langchain_groq import ChatGroq
 
 import re
 
 
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-LLM_MODEL = "llama3.2"   # Change if needed
+LLM_MODEL = "llama-3.1-8b-instant"   # Change if needed
 DB_PATH = "faiss_index"
 
 
@@ -32,7 +32,10 @@ vectordb = FAISS.load_local(
 
 retriever = vectordb.as_retriever(search_kwargs={"k": 4})
 
-llm = Ollama(model=LLM_MODEL)
+llm = ChatGroq(
+    model=LLM_MODEL,  # fast + cheap option on Groq
+    temperature=0,
+)
 
 
 # ---------------------------------------
@@ -133,7 +136,7 @@ Give a precise answer.
 
     answer = llm.invoke(llm_prompt)
 
-    return {"messages": [AIMessage(content=answer)]}
+    return {"messages": [AIMessage(content=answer.content)]}
 
 
 # ---------------------------------------
@@ -154,7 +157,7 @@ Provide a clear summary of the following document sections:
 
     summary = llm.invoke(prompt)
 
-    return {"messages": [AIMessage(content=summary)]}
+    return {"messages": [AIMessage(content=summary.content)]}
 
 
 # ---------------------------------------
