@@ -1,22 +1,22 @@
-# graph_app.py
-
 from typing_extensions import TypedDict
 from typing import Annotated
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 
-from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
+from langchain_core.messages import AIMessage, BaseMessage
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain_groq import ChatGroq
 
 import re
+import os
+
+from langchain_groq import ChatGroq
 
 
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-LLM_MODEL = "llama-3.1-8b-instant"   # Change if needed
 DB_PATH = "faiss_index"
 
+llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
 
 # ---------------------------------------
 # Load Local Embeddings + FAISS
@@ -32,18 +32,69 @@ vectordb = FAISS.load_local(
 
 retriever = vectordb.as_retriever(search_kwargs={"k": 4})
 
-llm = ChatGroq(
-    model=LLM_MODEL,  # fast + cheap option on Groq
-    temperature=0,
-)
+
+# ---------------------------------------
+# Helpers: citations
+# ---------------------------------------
+
+def _get_page(d) -> str:
+    """
+    Try common metadata keys for page.
+    PyPDFLoader usually uses 'page' (0-indexed).
+    We'll display as 1-indexed when possible.
+    """
+    page = d.metadata.get("page", None)
+    if isinstance(page, int):
+        return str(page + 1)
+    if page is None:
+        return "unknown"
+    return str(page)
+
+
+def _get_source(d) -> str:
+    """
+    PyPDFLoader often sets metadata['source'] to the file path.
+    We'll display just the filename if it's a path.
+    """
+    src = d.metadata.get("source", None)
+    if not src:
+        return "unknown_source"
+    return os.path.basename(str(src))
+
+
+def format_sources(docs) -> str:
+    """
+    Create a clean, de-duplicated Sources section like:
+    Sources:
+    - file.pdf (page 1)
+    - file.pdf (page 2)
+    """
+    seen = set()
+    lines = []
+    for d in docs:
+        src = _get_source(d)
+        page = _get_page(d)
+        key = (src, page)
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(f"- {src} (page {page})")
+
+    if not lines:
+        return ""
+
+    return "Sources:\n" + "\n".join(lines)
 
 
 # ---------------------------------------
 # Safe Retrieval Logic (LangChain 0.2+)
 # ---------------------------------------
 
-def retrieve_docs(query):
-    """Retrieves documents safely from retriever output."""
+def retrieve_docs(query: str):
+    """
+    Normalize retriever output to list[Document].
+    Some LC versions return a list, others return a dict with 'documents'.
+    """
     result = retriever.invoke(query)
 
     if isinstance(result, dict) and "documents" in result:
@@ -57,11 +108,10 @@ def retrieve_docs(query):
 
 # ---------------------------------------
 # Extraction Logic (EIN, Receipt, Invoice, Dates, etc.)
+# NOTE: Issue 1 only -> we add citations to the response, but keep extraction unchanged.
 # ---------------------------------------
 
-def extract_fields(text):
-    """Extracts EIN, receipt numbers, invoice numbers, dates, etc."""
-
+def extract_fields(text: str):
     patterns = {
         "EIN": r"\b\d{2}-\d{7}\b",
         "Receipt Number": r"\b(?:Receipt|Receipt No\.?|Receipt Number)[:\s#]*([A-Za-z0-9\-]+)\b",
@@ -71,7 +121,6 @@ def extract_fields(text):
     }
 
     extracted = {}
-
     for field, pattern in patterns.items():
         match = re.search(pattern, text, flags=re.IGNORECASE)
         if match:
@@ -103,27 +152,33 @@ def router_node(state: AgentState):
 
 
 # ---------------------------------------
-# QA Node — Full RAG + Extraction + LLM Reasoning
+# QA Node — RAG + Extraction + LLM Reasoning (+ Citations)
 # ---------------------------------------
 
 def rag_qa_node(state: AgentState):
     user_query = state["messages"][-1].content
     docs = retrieve_docs(user_query)
 
-    context = "\n\n---\n\n".join([d.page_content for d in docs])
+    context = "\n\n---\n\n".join(d.page_content for d in docs)
 
     # Extraction first (for numeric fields)
     extracted = extract_fields(context)
 
-    # If user asks specifically for EIN, receipt number, etc.
     lowered = user_query.lower()
     for field, value in extracted.items():
         if field.lower() in lowered:
-            return {"messages": [AIMessage(content=f"{field}: {value}")]}
+            # Issue 1: add citations for extracted answers too
+            sources = format_sources(docs)
+            citation_line = sources if sources else "Sources: unknown"
+            return {
+                "messages": [
+                    AIMessage(content=f"{field}: {value}\n\n{citation_line}")
+                ]
+            }
 
     # Otherwise use LLM for full reasoning
     llm_prompt = f"""
-You are a helpful assistant. Use ONLY the following context to answer:
+You are a helpful assistant. Use ONLY the following context to answer.
 
 Context:
 {context}
@@ -131,33 +186,46 @@ Context:
 Question:
 {user_query}
 
-Give a precise answer.
+If the answer is not present in the context, say "Not found in document."
 """
 
-    answer = llm.invoke(llm_prompt)
+    # Ollama returns a string; ChatGroq returns an AIMessage
+    resp = llm.invoke(llm_prompt)
+    answer_text = resp.content if hasattr(resp, "content") else str(resp)
 
-    return {"messages": [AIMessage(content=answer.content)]}
+    # Issue 1: append citations
+    sources = format_sources(docs)
+    if sources:
+        answer_text = f"{answer_text}\n\n{sources}"
+
+    return {"messages": [AIMessage(content=answer_text)]}
 
 
 # ---------------------------------------
-# Summary Node — Uses Local LLM
+# Summary Node — Uses LLM (+ Citations)
 # ---------------------------------------
 
 def rag_summary_node(state: AgentState):
     user_query = state["messages"][-1].content
     docs = retrieve_docs(user_query)
 
-    context = "\n\n---\n\n".join([d.page_content for d in docs])
+    context = "\n\n---\n\n".join(d.page_content for d in docs)
 
     prompt = f"""
-Provide a clear summary of the following document sections:
+Provide a clear summary of the following document sections.
+Use ONLY the provided text.
 
 {context}
 """
 
-    summary = llm.invoke(prompt)
+    resp = llm.invoke(prompt)
+    summary_text = resp.content if hasattr(resp, "content") else str(resp)
 
-    return {"messages": [AIMessage(content=summary.content)]}
+    sources = format_sources(docs)
+    if sources:
+        summary_text = f"{summary_text}\n\n{sources}"
+
+    return {"messages": [AIMessage(content=summary_text)]}
 
 
 # ---------------------------------------
